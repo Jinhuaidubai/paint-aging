@@ -1,0 +1,27 @@
+name: 自动训练
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:   # 允许手动触发
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python 依赖
+        run: |
+          pip install numpy pandas scipy scikit-learn lightgbm xgboost catboost -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+      - name: 运行训练脚本
+        run: python baseline.py
+
+      - name: 上传预测结果
+        uses: actions/upload-artifact@v4
+        with:
+          name: paint_pred
+          path: paint_pred.csv
