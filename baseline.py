@@ -1,7 +1,7 @@
 """
-分类融合版 —— 四分类 + 回归平滑
+分类融合版 —— 3分类 + 回归平滑
 ================================
-- 将 dietaE 分为 4 个区间进行多分类预测
+- 将 dietaE 分为 3 个区间（低/中/高）
 - 基模型：LGB, XGB, CatBoost, RF
 - 类别概率 Stacking，取众数中位数作为基础预测
 - 再用轻量 LGB 回归修正，最终加权平均
@@ -18,11 +18,11 @@ from scipy.optimize import curve_fit
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import RidgeCV
 from sklearn.model_selection import GroupKFold
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestClassifier
 from lightgbm import LGBMRegressor, LGBMClassifier
-from xgboost import XGBRegressor, XGBClassifier
-from catboost import CatBoostRegressor, CatBoostClassifier
+from xgboost import XGBClassifier
+from catboost import CatBoostClassifier
 
 RANDOM_STATE = 42
 TRAIN_CSV_PATH = "paint_aging_trainset.csv"
@@ -105,7 +105,6 @@ if __name__ == "__main__":
     y_all = df_train[TARGET_COL].values.astype(float)
     groups = df_train["sample"].astype(str).values
     feature_names = list(X_all.columns)
-    constraints = get_monotone_constraints(feature_names)
     print(f"[FEATURES] 数量: {len(feature_names)}")
 
     imputer = SimpleImputer(strategy="median")
@@ -113,146 +112,128 @@ if __name__ == "__main__":
     X_all_t = imputer.fit_transform(X_all)
     X_all_s = scaler.fit_transform(X_all_t)
 
-    # ---- 构建分类标签 ----
-    y_quantiles = np.percentile(y_all, [25, 50, 75])
-    print(f"[分箱] 阈值: 25%={y_quantiles[0]:.2f}, 50%={y_quantiles[1]:.2f}, 75%={y_quantiles[2]:.2f}")
-    y_class = np.digitize(y_all, bins=y_quantiles)  # 0,1,2,3
-    class_centers = [np.median(y_all[y_class == c]) for c in range(4)]
+    # ---- 构建3分类标签 ----
+    y_33pct, y_67pct = np.percentile(y_all, [33, 67])
+    print(f"[分箱] 阈值: 33%={y_33pct:.2f}, 67%={y_67pct:.2f}")
+    y_class = np.zeros(len(y_all), dtype=int)
+    y_class[y_all > y_33pct] = 1
+    y_class[y_all > y_67pct] = 2
+    class_centers = [np.median(y_all[y_class == c]) for c in range(3)]
     print(f"[分箱] 类别中位数: {class_centers}")
 
     # ---- GroupKFold OOF 分类概率 ----
     gkf = GroupKFold(n_splits=5)
-    oof_prob_lgb = np.zeros((len(y_all), 4))
-    oof_prob_xgb = np.zeros((len(y_all), 4))
-    oof_prob_cat = np.zeros((len(y_all), 4))
-    oof_prob_rf  = np.zeros((len(y_all), 4))
+    oof_prob_lgb = np.zeros((len(y_all), 3))
+    oof_prob_xgb = np.zeros((len(y_all), 3))
+    oof_prob_cat = np.zeros((len(y_all), 3))
+    oof_prob_rf  = np.zeros((len(y_all), 3))
 
     for fold, (train_idx, valid_idx) in enumerate(gkf.split(X_all_s, y_class, groups=groups)):
         print(f"\n--- Fold {fold+1} ---")
         X_tr, X_val = X_all_s[train_idx], X_all_s[valid_idx]
         y_tr = y_class[train_idx]
 
-        # LightGBM 分类
         print("  [LGB] 分类...")
-        lgb = LGBMClassifier(
-            n_estimators=500, max_depth=7, learning_rate=0.03,
-            num_leaves=80, subsample=0.85, colsample_bytree=0.85,
-            random_state=RANDOM_STATE, n_jobs=-1, verbose=-1
-        )
+        lgb = LGBMClassifier(n_estimators=500, max_depth=7, learning_rate=0.03,
+                             num_leaves=80, subsample=0.85, colsample_bytree=0.85,
+                             random_state=RANDOM_STATE, n_jobs=-1, verbose=-1)
         lgb.fit(X_tr, y_tr)
         oof_prob_lgb[valid_idx] = lgb.predict_proba(X_val)
 
-        # XGBoost 分类
         print("  [XGB] 分类...")
-        xgb = XGBClassifier(
-            n_estimators=500, max_depth=7, learning_rate=0.03,
-            subsample=0.85, colsample_bytree=0.85,
-            random_state=RANDOM_STATE, n_jobs=-1, verbosity=0
-        )
+        xgb = XGBClassifier(n_estimators=500, max_depth=7, learning_rate=0.03,
+                            subsample=0.85, colsample_bytree=0.85,
+                            random_state=RANDOM_STATE, n_jobs=-1, verbosity=0)
         xgb.fit(X_tr, y_tr)
         oof_prob_xgb[valid_idx] = xgb.predict_proba(X_val)
 
-        # CatBoost 分类
         print("  [Cat] 分类...")
-        cat = CatBoostClassifier(
-            iterations=500, depth=6, learning_rate=0.03,
-            random_seed=RANDOM_STATE, thread_count=-1, silent=True
-        )
+        cat = CatBoostClassifier(iterations=500, depth=6, learning_rate=0.03,
+                                 random_seed=RANDOM_STATE, thread_count=-1, silent=True)
         cat.fit(X_tr, y_tr)
         oof_prob_cat[valid_idx] = cat.predict_proba(X_val)
 
-        # RandomForest 分类
         print("  [RF] 分类...")
-        rf = RandomForestClassifier(
-            n_estimators=400, max_depth=12,
-            random_state=RANDOM_STATE, n_jobs=-1
-        )
+        rf = RandomForestClassifier(n_estimators=400, max_depth=12,
+                                    random_state=RANDOM_STATE, n_jobs=-1)
         rf.fit(X_tr, y_tr)
         oof_prob_rf[valid_idx] = rf.predict_proba(X_val)
 
     # 元模型融合概率
     meta_models = []
-    oof_class_pred = np.zeros(len(y_all))
-    for c in range(4):
-        X_meta_c = np.column_stack([
-            oof_prob_lgb[:, c], oof_prob_xgb[:, c], oof_prob_cat[:, c], oof_prob_rf[:, c]
-        ])
+    for c in range(3):
+        X_meta_c = np.column_stack([oof_prob_lgb[:,c], oof_prob_xgb[:,c], oof_prob_cat[:,c], oof_prob_rf[:,c]])
         meta = RidgeCV(alphas=[0.1, 1.0, 10.0, 100.0])
         meta.fit(X_meta_c, (y_class == c).astype(int))
         meta_models.append(meta)
-        oof_class_pred += meta.predict(X_meta_c)  # 加权概率求和
 
-    # 取最大概率类别
-    oof_pred_class_probs = np.column_stack([m.predict(X_meta_c) for m, X_meta_c in
-        [(meta_models[c], np.column_stack([oof_prob_lgb[:, c], oof_prob_xgb[:, c], oof_prob_cat[:, c], oof_prob_rf[:, c]])) for c in range(4)]])
-    oof_class = np.argmax(oof_pred_class_probs, axis=1)
+    # 最终预测类别
+    final_probs_oof = np.column_stack([
+        meta_models[c].predict(np.column_stack([oof_prob_lgb[:,c], oof_prob_xgb[:,c], oof_prob_cat[:,c], oof_prob_rf[:,c]]))
+        for c in range(3)
+    ])
+    oof_class = np.argmax(final_probs_oof, axis=1)
     oof_reg_pred = np.array([class_centers[cl] for cl in oof_class])
     mae_class = np.mean(np.abs(y_all - oof_reg_pred))
     print(f"\n[分类基] MAE: {mae_class:.4f}")
 
     # ---- 轻量回归修正 ----
     print("\n[修正] 训练轻量回归模型...")
-    lgb_reg = LGBMRegressor(
-        n_estimators=300, max_depth=5, learning_rate=0.03,
-        num_leaves=31, subsample=0.8, colsample_bytree=0.8,
-        random_state=RANDOM_STATE, n_jobs=-1, verbose=-1
-    )
+    lgb_reg = LGBMRegressor(n_estimators=300, max_depth=5, learning_rate=0.03,
+                            num_leaves=31, subsample=0.8, colsample_bytree=0.8,
+                            random_state=RANDOM_STATE, n_jobs=-1, verbose=-1)
     lgb_reg.fit(X_all_s, np.log1p(y_all))
-    oof_reg_log = lgb_reg.predict(X_all_s)
-    oof_reg = np.expm1(oof_reg_log)
+    oof_reg = np.expm1(lgb_reg.predict(X_all_s))
 
     # 加权融合
     final_alpha = 0.5
     oof_final = final_alpha * oof_reg_pred + (1 - final_alpha) * oof_reg
     mae_final = np.mean(np.abs(y_all - oof_final))
-    print(f"[融合] 分类+回归 加权 OOF MAE: {mae_final:.4f}")
+    print(f"[融合] 加权 OOF MAE: {mae_final:.4f}")
 
-    # ---- 全量训练基分类器与回归器，预测测试集 ----
+    # ---- 全量训练并预测测试集 ----
     print("\n[全量] 训练分类器与回归器...")
     X_test = build_features(df_test, rate_map, global_mean, train_samples)
     X_test_final = X_test[feature_names]
     X_te_t = imputer.transform(X_test_final)
     X_te_s = scaler.transform(X_te_t)
 
-    # 全量分类器
-    lgb_full_clf = LGBMClassifier(n_estimators=800, max_depth=8, learning_rate=0.02,
-                                  num_leaves=100, subsample=0.9, colsample_bytree=0.9,
-                                  random_state=RANDOM_STATE, n_jobs=-1, verbose=-1)
-    lgb_full_clf.fit(X_all_s, y_class)
-    prob_lgb_test = lgb_full_clf.predict_proba(X_te_s)
+    lgb_full = LGBMClassifier(n_estimators=800, max_depth=8, learning_rate=0.02,
+                              num_leaves=100, subsample=0.9, colsample_bytree=0.9,
+                              random_state=RANDOM_STATE, n_jobs=-1, verbose=-1)
+    lgb_full.fit(X_all_s, y_class)
+    prob_lgb_test = lgb_full.predict_proba(X_te_s)
 
-    xgb_full_clf = XGBClassifier(n_estimators=800, max_depth=8, learning_rate=0.02,
-                                 subsample=0.9, colsample_bytree=0.9,
-                                 random_state=RANDOM_STATE, n_jobs=-1, verbosity=0)
-    xgb_full_clf.fit(X_all_s, y_class)
-    prob_xgb_test = xgb_full_clf.predict_proba(X_te_s)
+    xgb_full = XGBClassifier(n_estimators=800, max_depth=8, learning_rate=0.02,
+                             subsample=0.9, colsample_bytree=0.9,
+                             random_state=RANDOM_STATE, n_jobs=-1, verbosity=0)
+    xgb_full.fit(X_all_s, y_class)
+    prob_xgb_test = xgb_full.predict_proba(X_te_s)
 
-    cat_full_clf = CatBoostClassifier(iterations=800, depth=8, learning_rate=0.02,
-                                      random_seed=RANDOM_STATE, thread_count=-1, silent=True)
-    cat_full_clf.fit(X_all_s, y_class)
-    prob_cat_test = cat_full_clf.predict_proba(X_te_s)
+    cat_full = CatBoostClassifier(iterations=800, depth=8, learning_rate=0.02,
+                                  random_seed=RANDOM_STATE, thread_count=-1, silent=True)
+    cat_full.fit(X_all_s, y_class)
+    prob_cat_test = cat_full.predict_proba(X_te_s)
 
-    rf_full_clf = RandomForestClassifier(n_estimators=500, max_depth=12,
-                                         random_state=RANDOM_STATE, n_jobs=-1)
-    rf_full_clf.fit(X_all_s, y_class)
-    prob_rf_test = rf_full_clf.predict_proba(X_te_s)
+    rf_full = RandomForestClassifier(n_estimators=500, max_depth=12,
+                                     random_state=RANDOM_STATE, n_jobs=-1)
+    rf_full.fit(X_all_s, y_class)
+    prob_rf_test = rf_full.predict_proba(X_te_s)
 
     # 元模型融合测试集概率
-    final_probs_test = np.zeros((len(X_test), 4))
-    for c in range(4):
-        X_meta_test_c = np.column_stack([prob_lgb_test[:, c], prob_xgb_test[:, c],
-                                         prob_cat_test[:, c], prob_rf_test[:, c]])
-        final_probs_test[:, c] = meta_models[c].predict(X_meta_test_c)
+    final_probs_test = np.zeros((len(X_test), 3))
+    for c in range(3):
+        X_meta_test_c = np.column_stack([prob_lgb_test[:,c], prob_xgb_test[:,c],
+                                         prob_cat_test[:,c], prob_rf_test[:,c]])
+        final_probs_test[:,c] = meta_models[c].predict(X_meta_test_c)
 
     test_class = np.argmax(final_probs_test, axis=1)
     test_reg_pred = np.array([class_centers[cl] for cl in test_class])
 
     # 全量回归修正模型
-    lgb_reg_full = LGBMRegressor(
-        n_estimators=500, max_depth=6, learning_rate=0.02,
-        num_leaves=60, subsample=0.85, colsample_bytree=0.85,
-        random_state=RANDOM_STATE, n_jobs=-1, verbose=-1
-    )
+    lgb_reg_full = LGBMRegressor(n_estimators=500, max_depth=6, learning_rate=0.02,
+                                 num_leaves=60, subsample=0.85, colsample_bytree=0.85,
+                                 random_state=RANDOM_STATE, n_jobs=-1, verbose=-1)
     lgb_reg_full.fit(X_all_s, np.log1p(y_all))
     test_reg = np.expm1(lgb_reg_full.predict(X_te_s))
 
@@ -264,3 +245,4 @@ if __name__ == "__main__":
     pred_df.to_csv(PRED_OUTPUT_CSV, index=False, encoding="utf-8")
     print(f"\n[OK] 分类融合预测已保存: {PRED_OUTPUT_CSV}")
     print(pred_df.describe())
+
